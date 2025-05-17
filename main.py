@@ -1,6 +1,7 @@
 # main.py
 
 import pandas as pd
+import numpy as np
 import logging
 import torch # Import torch to trigger MPS check if available
 
@@ -65,7 +66,7 @@ def run_pipeline():
         return # Exit if target column isn't available
 
     # Select only numeric columns for further processing like scaling/modeling later
-    numeric_cols = df_analysis.select_dtypes(include=pd.np.number).columns.tolist()
+    numeric_cols = df_analysis.select_dtypes(include=np.number).columns.tolist()
     logging.info(f"Numeric columns identified: {numeric_cols}")
 
     # Handle Missing Values (Example: using forward fill for numeric columns)
