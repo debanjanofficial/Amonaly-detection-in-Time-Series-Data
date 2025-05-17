@@ -5,45 +5,92 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def preprocess_timestamps(df: pd.DataFrame, start_col: str, end_col: str = None) -> pd.DataFrame:
-    
+    """
+    Ensures timestamp columns are in datetime format using the specified format string.
+    """
     logging.info(f"Preprocessing timestamp columns: {start_col}" + (f", {end_col}" if end_col else ""))
-    if start_col in df.columns:
-        df[start_col] = pd.to_datetime(df[start_col], errors='coerce')
-        # Check for parsing errors (NaT values)
-        if df[start_col].isnull().any():
-            logging.warning(f"Found NaT values in '{start_col}' after conversion. Check original data format.")
+
+    # ***********************************************************************************
+    # *** Set the confirmed date format string here ***
+    actual_date_format_in_csv = '%b %d, %Y %I:%M %p'
+    # ***********************************************************************************
+
+    if actual_date_format_in_csv:
+        logging.info(f"Attempting to parse dates with specified format: {actual_date_format_in_csv}")
     else:
-        logging.warning(f"Start column '{start_col}' not found in DataFrame.")
+        # This part should ideally not be reached if you've confirmed the format
+        logging.warning("No specific date format provided. Date parsing might be slow or error-prone.")
 
-    if end_col and end_col in df.columns:
-        df[end_col] = pd.to_datetime(df[end_col], errors='coerce')
-        if df[end_col].isnull().any():
-            logging.warning(f"Found NaT values in '{end_col}' after conversion. Check original data format.")
-    elif end_col:
-        logging.warning(f"End column '{end_col}' not found in DataFrame.")
 
+    for col_name in [start_col, end_col]:
+        if col_name and col_name in df.columns:
+            # Ensure the column is of string type before attempting to_datetime with a format string,
+            # especially if parse_dates in read_csv might have already converted it (or parts of it).
+            if not pd.api.types.is_datetime64_any_dtype(df[col_name]): # Only process if not already datetime
+                try:
+                    df[col_name] = pd.to_datetime(df[col_name].astype(str), format=actual_date_format_in_csv, errors='raise')
+                    logging.info(f"Successfully parsed '{col_name}' using format '{actual_date_format_in_csv}'.")
+                except (ValueError, TypeError) as e:
+                    logging.warning(f"Could not parse '{col_name}' with format '{actual_date_format_in_csv}' (Error: {e}). Falling back to inference.")
+                    df[col_name] = pd.to_datetime(df[col_name], errors='coerce') # Fallback if explicit format fails
+            else:
+                logging.info(f"Column '{col_name}' is already in datetime format.")
+
+
+            if df[col_name].isnull().any():
+                num_nulls = df[col_name].isnull().sum()
+                original_non_nulls = df[col_name].notnull().sum() + num_nulls # Count before potential new NaTs
+                logging.warning(f"Found {num_nulls} NaT (Not a Time) values in '{col_name}' out of {original_non_nulls} original entries after conversion. Review data and format string.")
+        elif col_name:
+            logging.warning(f"Column '{col_name}' for date parsing not found in DataFrame.")
     return df
 
-def set_time_index(df: pd.DataFrame, index_col: str) -> pd.DataFrame:
-    
+def set_time_index(df: pd.DataFrame, index_col: str, duplicate_handling: str = 'first') -> pd.DataFrame:
     if index_col not in df.columns:
         logging.error(f"Index column '{index_col}' not found.")
         return df
     if not pd.api.types.is_datetime64_any_dtype(df[index_col]):
-         logging.warning(f"Index column '{index_col}' is not datetime. Attempting conversion.")
-         df[index_col] = pd.to_datetime(df[index_col], errors='coerce')
-         if df[index_col].isnull().any():
-             logging.error(f"Failed to convert index column '{index_col}' to datetime. Cannot set index.")
-             return df
+        logging.warning(f"Index column '{index_col}' is not datetime. It should have been converted by preprocess_timestamps.")
+        # Attempt one last time or error out
+        df[index_col] = pd.to_datetime(df[index_col], errors='coerce')
+        if df[index_col].isnull().any():
+            logging.error(f"Failed to convert index column '{index_col}' to datetime. Cannot set index.")
+            return df
 
     logging.info(f"Setting '{index_col}' as index.")
-    df = df.set_index(index_col)
-    df = df.sort_index()
+    # Ensure index_col is not already the index to avoid issues with reset_index if it's not set
+    if df.index.name != index_col:
+         # If index_col is a regular column, set it as index
+        if index_col in df.columns:
+            df = df.set_index(index_col)
+        else: # This case should not happen if previous checks are fine
+            logging.error(f"Column '{index_col}' cannot be set as index as it does not exist.")
+            return df
+    # else: index is already set to index_col, no action needed for setting
+
+
     # Check for duplicate indices
     if df.index.duplicated().any():
-        logging.warning(f"Duplicate timestamps found in index '{index_col}'. Consider aggregation or removal.")
-        # Optional: Handle duplicates, e.g., keep first or average
-        # df = df[~df.index.duplicated(keep='first')]
+        logging.warning(f"Duplicate timestamps found in index '{df.index.name}'. Handling strategy: {duplicate_handling}")
+        if duplicate_handling == 'first':
+            df = df[~df.index.duplicated(keep='first')]
+        elif duplicate_handling == 'last':
+            df = df[~df.index.duplicated(keep='last')]
+        elif duplicate_handling == 'mean':
+            numeric_df = df.select_dtypes(include=np.number)
+            non_numeric_df = df.select_dtypes(exclude=np.number)
+            df_mean = numeric_df.groupby(numeric_df.index).mean()
+            if not non_numeric_df.empty:
+                df_non_numeric_agg = non_numeric_df.groupby(non_numeric_df.index).first() # Or another strategy
+                df = pd.concat([df_mean, df_non_numeric_agg], axis=1)
+            else:
+                df = df_mean
+            logging.info("Aggregated duplicate indices by mean for numeric columns and first for others.")
+        # Else (None or unknown strategy), do nothing and leave duplicates
+    else:
+        logging.info(f"No duplicate timestamps found in index '{df.index.name}'.")
+
+    df = df.sort_index()
     return df
 
 def clean_numeric_column(series: pd.Series) -> pd.Series:

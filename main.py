@@ -56,7 +56,9 @@ def run_pipeline():
     df_analysis = preprocessing.preprocess_timestamps(df_analysis, 'Start date', 'End date')
 
     # Set time index
-    df_analysis = preprocessing.set_time_index(df_analysis, 'Start date')
+    df_analysis = preprocessing.set_time_index(df_analysis, 'Start date',duplicate_handling='first' # Or your choice: 'mean', 'last'
+)
+
 
     # Clean the target numeric column
     if target_column in df_analysis.columns:
