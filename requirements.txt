@@ -1,4 +1,4 @@
 pandas
 numpy
 torch  
-matplotlib 
+matplotlib
