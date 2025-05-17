@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 import logging
+from sklearn.preprocessing import MinMaxScaler
+import torch
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -165,6 +168,145 @@ def handle_missing_values(df: pd.DataFrame, strategy: str = 'ffill', columns: li
 
     # Handle potential NaNs remaining after ffill (at the start) or bfill (at the end)
     if strategy in ['ffill', 'bfill']:
-         df.fillna(0, inplace=True) # Example: fill remaining NaNs with 0 after ffill/bfill
+         df.fillna(0, inplace=True)
 
     return df
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds time-based features to the DataFrame from its DatetimeIndex.
+    Assumes df has a DatetimeIndex.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        logging.error("DataFrame does not have a DatetimeIndex. Cannot add time features.")
+        return df
+
+    df_copy = df.copy()
+    df_copy['hour'] = df_copy.index.hour
+    df_copy['dayofweek'] = df_copy.index.dayofweek # Monday=0, Sunday=6
+    df_copy['dayofmonth'] = df_copy.index.day
+    df_copy['dayofyear'] = df_copy.index.dayofyear
+    df_copy['month'] = df_copy.index.month
+    df_copy['year'] = df_copy.index.year
+    df_copy['quarter'] = df_copy.index.quarter
+    df_copy['weekofyear'] = df_copy.index.isocalendar().week.astype(int)
+    df_copy['is_weekend'] = (df_copy.index.dayofweek >= 5).astype(int) # 1 if weekend, 0 if weekday
+
+    logging.info(f"Added time features: {['hour', 'dayofweek', 'dayofmonth', 'dayofyear', 'month', 'year', 'quarter', 'weekofyear', 'is_weekend']}")
+    return df_copy
+
+def add_lag_features(df: pd.DataFrame, target_column: str, lags: list) -> pd.DataFrame:
+    """
+    Adds lag features for a specific target column.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame with DatetimeIndex.
+        target_column (str): The column to create lag features from.
+        lags (list of int): A list of lag periods (e.g., [1, 2, 24] for 1h, 2h, 24h ago).
+    """
+    if target_column not in df.columns:
+        logging.error(f"Target column '{target_column}' not found for lag feature creation.")
+        return df
+
+    df_copy = df.copy()
+    for lag in lags:
+        if lag <= 0:
+            logging.warning(f"Lag value must be positive. Skipping lag: {lag}")
+            continue
+        lag_col_name = f'{target_column}_lag_{lag}'
+        df_copy[lag_col_name] = df_copy[target_column].shift(lag)
+        logging.info(f"Added lag feature: {lag_col_name}")
+
+    # Lags will introduce NaNs at the beginning, which need to be handled
+    return df_copy
+
+def add_rolling_features(df: pd.DataFrame, target_column: str, window_sizes: list, aggs: list = None) -> pd.DataFrame:
+    
+    if aggs is None:
+        aggs = ['mean', 'std']
+
+    if target_column not in df.columns:
+        logging.error(f"Target column '{target_column}' not found for rolling feature creation.")
+        return df
+
+    df_copy = df.copy()
+    for window in window_sizes:
+        if window <= 0:
+            logging.warning(f"Window size must be positive. Skipping window: {window}")
+            continue
+        
+        # min_periods=1 ensures that we get a value even if the window is not full (at the start)
+        # 'closed="left"' aligns the window so it uses past data up to (but not including) the current observation.
+        # For anomaly detection, using 'closed="neither"' or 'closed="right"' (default) might be more common
+        # to include the current point or a centered window if appropriate.
+        # Let's use default (closed='right') which includes the current point in the calculation if not shifted.
+        # To calculate based on *past* data, we'd shift the target first or use a specific windowing lib.
+        # For simplicity here, we'll use the standard rolling which includes the current point if not careful.
+        # A common practice for features is to use past data:
+        # df_copy[target_column].shift(1).rolling(window=window, min_periods=1)
+
+        for agg in aggs:
+            roll_col_name = f'{target_column}_roll_{agg}_{window}h'
+            try:
+                # Calculate rolling features on PAST data by shifting the target column by 1
+                # This prevents data leakage from the current timestep if these features are used for prediction
+                # For pure anomaly detection on current point, you might not shift.
+                # Let's use past data for features.
+                series_to_roll = df_copy[target_column].shift(1) # Shift by 1 to use only past data
+                df_copy[roll_col_name] = series_to_roll.rolling(window=window, min_periods=1).agg(agg)
+                logging.info(f"Added rolling feature: {roll_col_name}")
+            except Exception as e:
+                logging.error(f"Could not apply rolling {agg} for window {window} on {target_column}: {e}")
+    return df_copy
+
+from typing import Tuple
+
+def scale_features(df: pd.DataFrame, exclude_cols: list = None) -> Tuple[pd.DataFrame, MinMaxScaler]:
+    """
+    Scales numeric features in the DataFrame using MinMaxScaler.
+    Non-numeric columns and columns in exclude_cols are not scaled.
+
+    Args:
+        df (pd.DataFrame): DataFrame with features.
+        exclude_cols (list, optional): List of column names to exclude from scaling.
+
+    Returns:
+        pd.DataFrame: DataFrame with scaled numeric features.
+        MinMaxScaler: The fitted scaler object.
+    """
+    df_scaled = df.copy()
+    scalers = {} # To store scalers for each column if needed, or one for all
+
+    numeric_cols = df_scaled.select_dtypes(include=np.number).columns.tolist()
+    if exclude_cols:
+        cols_to_scale = [col for col in numeric_cols if col not in exclude_cols]
+    else:
+        cols_to_scale = numeric_cols
+    
+    if not cols_to_scale:
+        logging.warning("No columns found to scale.")
+        return df_scaled, None # Return None if no scaler fitted
+
+    scaler = MinMaxScaler()
+    df_scaled[cols_to_scale] = scaler.fit_transform(df_scaled[cols_to_scale])
+    logging.info(f"Scaled columns: {cols_to_scale}")
+    
+    return df_scaled, scaler # Return the single scaler used for all these columns
+
+def create_sequences(data: np.ndarray, sequence_length: int) -> np.ndarray:
+    """
+    Transforms a 2D array of time series data into 3D sequences.
+
+    Args:
+        data (np.ndarray): 2D array of shape (n_samples, n_features).
+        sequence_length (int): The length of each output sequence.
+
+    Returns:
+        np.ndarray: 3D array of shape (n_samples - sequence_length + 1, sequence_length, n_features).
+    """
+    xs = []
+    for i in range(len(data) - sequence_length + 1):
+        x = data[i:(i + sequence_length)]
+        xs.append(x)
+    logging.info(f"Created sequences with length {sequence_length}. Number of sequences: {len(xs)}")
+    return np.array(xs)
